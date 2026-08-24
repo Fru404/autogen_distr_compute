@@ -27,6 +27,7 @@ from fastapi import (
 from fastapi.responses import (
     JSONResponse,
     FileResponse,
+    CORSMiddleware,
 )
 
 from docx import Document
@@ -79,6 +80,23 @@ WORKER_URLS = [
     if url.strip()
 ]
 
+app.add_middleware(
+    CORSMiddleware,
+
+    allow_origins=[
+        "*"
+    ],
+
+    allow_credentials=True,
+
+    allow_methods=[
+        "*"
+    ],
+
+    allow_headers=[
+        "*"
+    ],
+)
 # ------------------------------------------------------------
 # Security
 # ------------------------------------------------------------
