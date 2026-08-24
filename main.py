@@ -176,6 +176,10 @@ app.add_middleware(
 
 jobs: dict[str, dict[str, Any]] = {}
 
+# The frontend talks to the coordinator without needing a job ID.
+# This pointer identifies the most recent active generation.
+current_job_id: str | None = None
+
 
 # ============================================================
 # LOGGING
@@ -1409,9 +1413,13 @@ async def process_local_chunk(
                 "last_file"
             ] = output_file.name
 
-            node[
-                "last_file_time"
-            ] = file_elapsed
+            node["last_file_time"] = file_elapsed
+
+            job["current_file"] = output_file.name
+            job["current_file_time"] = file_elapsed
+            job["message"] = (
+                f"NODE-1: {output_file.name}"
+            )
 
             recalculate_job_progress(
                 job
@@ -2434,233 +2442,149 @@ async def inspect_files(
 
 @app.post("/generate")
 async def generate(
-
     template: UploadFile = File(...),
-
     data_json: str = Form(...)
-
 ):
 
-    if NODE_ROLE != "coordinator":
+    global current_job_id
 
+    if NODE_ROLE != "coordinator":
         raise HTTPException(
             status_code=403,
             detail="Generation must be requested from the coordinator."
         )
 
+    # --------------------------------------------------------
+    # Prevent two generations from overwriting the same
+    # coordinator progress state.
+    # --------------------------------------------------------
+    if current_job_id:
+        existing = jobs.get(current_job_id)
+        if existing and existing.get("status") in {
+            "starting",
+            "running",
+            "combining"
+        }:
+            raise HTTPException(
+                status_code=409,
+                detail="A generation is already running."
+            )
+
     started = time.perf_counter()
 
     try:
-
-        rows = json.loads(
-            data_json
-        )
-
+        rows = json.loads(data_json)
     except Exception:
-
         raise HTTPException(
             status_code=400,
             detail="Invalid data_json."
         )
 
-    if not isinstance(
-        rows,
-        list
-    ):
-
+    if not isinstance(rows, list):
         raise HTTPException(
             status_code=400,
             detail="data_json must be a list."
         )
 
     if not rows:
-
         raise HTTPException(
             status_code=400,
             detail="No rows supplied."
         )
 
-    template_bytes = await (
-        template.read()
-    )
+    template_bytes = await template.read()
 
     job_id = uuid.uuid4().hex
+    current_job_id = job_id
 
     total = len(rows)
-
-    node_count = calculate_node_count(
-        total
-    )
-
-    chunks = split_rows(
-        rows,
-        node_count
-    )
-
-    # --------------------------------------------------------
-    # Job
-    # --------------------------------------------------------
+    node_count = calculate_node_count(total)
+    chunks = split_rows(rows, node_count)
 
     job = {
-
-        "job_id":
-            job_id,
-
-        "status":
-            "starting",
-
-        "total":
-            total,
-
-        "completed":
-            0,
-
-        "progress":
-            0,
-
-        "failed":
-            0,
-
-        "node_count":
-            node_count,
-
-        "nodes":
-            {},
-
-        "started":
-            started,
-
-        "generation_elapsed":
-            None,
-
-        "zip_elapsed":
-            None,
-
-        "final_elapsed":
-            None,
-
-        "final_zip":
-            None
+        "job_id": job_id,
+        "status": "starting",
+        "total": total,
+        "completed": 0,
+        "progress": 0,
+        "failed": 0,
+        "node_count": node_count,
+        "nodes": {},
+        "started": started,
+        "generation_elapsed": None,
+        "zip_elapsed": None,
+        "final_elapsed": None,
+        "final_zip": None,
+        "current_file": None,
+        "current_file_time": None,
+        "message": "Starting generation...",
+        "error": None,
     }
 
     jobs[job_id] = job
 
-    # --------------------------------------------------------
-    # Initialize nodes
-    # --------------------------------------------------------
-
-    for index, chunk in enumerate(
-        chunks
-    ):
-
-        node_name = (
-            f"NODE-{index + 1}"
-        )
-
-        job["nodes"][
-            node_name
-        ] = {
-
-            "total":
-                len(chunk),
-
-            "completed":
-                0,
-
-            "progress":
-                0,
-
-            "elapsed":
-                0,
-
-            "rate":
-                0,
-
-            "eta":
-                0,
-
-            "status":
-                "waiting",
-
-            "last_file":
-                None,
-
-            "last_file_time":
-                None,
-
-            "errors":
-                []
+    for index, chunk in enumerate(chunks):
+        node_name = f"NODE-{index + 1}"
+        job["nodes"][node_name] = {
+            "total": len(chunk),
+            "completed": 0,
+            "progress": 0,
+            "elapsed": 0,
+            "rate": 0,
+            "eta": 0,
+            "status": "waiting",
+            "last_file": None,
+            "last_file_time": None,
+            "errors": []
         }
 
     log_line()
+    log("GENERATION START")
+    log(f"Job: {job_id}")
+    log(f"Files: {total}")
+    log(f"Files/sec model: {FILES_PER_SECOND}")
+    log(f"Capacity/node: {CAPACITY_PER_NODE}")
+    log(f"Available nodes: {len(WORKER_URLS) + 1}")
+    log(f"Nodes selected: {node_count}")
 
-    log(
-        "GENERATION START"
-    )
+    for index, chunk in enumerate(chunks):
+        log(f"NODE-{index + 1}: {len(chunk)} files")
 
-    log(
-        f"Job: {job_id}"
-    )
-
-    log(
-        f"Files: {total}"
-    )
-
-    log(
-        f"Available nodes: "
-        f"{len(WORKER_URLS) + 1}"
-    )
-
-    log(
-        f"Nodes selected: "
-        f"{node_count}"
-    )
-
-    log(
-        f"Capacity/node: "
-        f"{CAPACITY_PER_NODE}"
-    )
-
-    for index, chunk in enumerate(
-        chunks
-    ):
-
-        log(
-            f"NODE-{index + 1}: "
-            f"{len(chunk)} files"
-        )
-
-    # --------------------------------------------------------
-    # Start background generation
-    # --------------------------------------------------------
-
-    asyncio.create_task(
-
-        run_generation(
-
+    # IMPORTANT: /generate keeps the existing frontend contract and
+    # returns the ZIP itself. Progress is queried independently from
+    # GET /progress while this request is running.
+    try:
+        final_zip = await run_generation(
             job_id,
-
             template_bytes,
-
             chunks
-
         )
-    )
 
-    return {
+        if not final_zip or not Path(final_zip).exists():
+            raise RuntimeError("Final ZIP was not created.")
 
-        "job_id":
-            job_id,
+        return FileResponse(
+            path=str(final_zip),
+            media_type="application/zip",
+            filename="autogen_receipts.zip"
+        )
 
-        "status":
-            "started",
+    except HTTPException:
+        raise
 
-        "total":
-            total,
+    except Exception as error:
+        job["status"] = "error"
+        job["error"] = str(error)
+        job["message"] = "Generation failed."
 
-        "nodes":
-            node_count
-    }
+        log_line()
+        log(f"GENERATION FAILED: {error}")
+        log_line()
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Generation failed: {error}"
+        )
 
 
 # ============================================================
@@ -2681,9 +2605,8 @@ async def run_generation(
         time.perf_counter()
     )
 
-    job["status"] = (
-        "running"
-    )
+    job["status"] = "running"
+    job["message"] = "Generating receipts..."
 
     tasks = []
 
@@ -2857,6 +2780,9 @@ async def run_generation(
 
     log_line()
 
+    job["status"] = "combining"
+    job["message"] = "Creating final ZIP..."
+
     log(
         "CREATING FINAL ZIP..."
     )
@@ -2928,18 +2854,11 @@ async def run_generation(
     )
 
     if job["failed"] > 0:
-
-        job[
-            "status"
-        ] = (
-            "completed_with_errors"
-        )
-
+        job["status"] = "completed_with_errors"
+        job["message"] = "Generation completed with errors."
     else:
-
-        job[
-            "status"
-        ] = "completed"
+        job["status"] = "completed"
+        job["message"] = "Generation complete."
 
     log_line()
 
@@ -2993,6 +2912,8 @@ async def run_generation(
     )
 
     log_line()
+
+    return final_zip
 
 
 # ============================================================
@@ -3149,8 +3070,14 @@ async def internal_progress(
 
     node["last_file"] = filename
 
-    node["last_file_time"] = (
-        file_time
+    node["last_file_time"] = file_time
+
+    job["current_file"] = filename
+    job["current_file_time"] = file_time
+    job["message"] = (
+        f"{node_name}: {filename}"
+        if filename
+        else job.get("message", "Generating receipts...")
     )
 
     node["status"] = payload.get(
@@ -3194,64 +3121,158 @@ async def internal_progress(
 # PROGRESS API FOR NEXT.JS
 # ============================================================
 
-@app.get("/progress/{job_id}")
-async def get_progress(
-    job_id: str
-):
+def build_progress_response(job):
+    if not job:
+        return {
+            "status": "idle",
+            "total": 0,
+            "completed": 0,
+            "percentage": 0,
+            "current_file": None,
+            "elapsed_seconds": 0,
+            "average_seconds_per_file": 0,
+            "estimated_remaining_seconds": 0,
+            "zip_seconds": 0,
+            "total_seconds": 0,
+            "coordinator": {
+                "completed": 0,
+                "total": 0
+            },
+            "workers": [],
+            "message": "Ready.",
+            "error": None
+        }
 
-    job = jobs.get(
-        job_id
+    now = time.perf_counter()
+    start_time = job.get("started") or now
+    elapsed = job.get("generation_elapsed")
+
+    if elapsed is None and job.get("status") in {
+        "starting",
+        "running",
+        "combining"
+    }:
+        elapsed = now - start_time
+
+    elapsed = float(elapsed or 0)
+    completed = int(job.get("completed", 0))
+    total = int(job.get("total", 0))
+
+    average = (
+        elapsed / completed
+        if completed > 0
+        else 0
     )
 
-    if not job:
+    remaining = max(
+        total - completed,
+        0
+    )
 
+    eta = (
+        remaining * average
+        if average > 0
+        else 0
+    )
+
+    workers = []
+
+    for node_name, node in job.get("nodes", {}).items():
+        workers.append({
+            "id": node_name,
+            "completed": int(node.get("completed", 0)),
+            "total": int(node.get("total", 0)),
+            "status": node.get("status", "waiting"),
+            "progress": int(node.get("progress", 0)),
+            "elapsed": float(node.get("elapsed", 0) or 0),
+            "rate": float(node.get("rate", 0) or 0),
+            "eta": float(node.get("eta", 0) or 0),
+            "last_file": node.get("last_file"),
+            "last_file_time": node.get("last_file_time"),
+            "errors": node.get("errors", [])
+        })
+
+    final_elapsed = job.get("final_elapsed")
+    if final_elapsed is None:
+        final_elapsed = elapsed + float(job.get("zip_elapsed") or 0)
+
+    return {
+        "job_id": job.get("job_id"),
+        "status": job.get("status", "idle"),
+        "total": total,
+        "completed": completed,
+        "percentage": int(job.get("progress", 0)),
+        "progress": int(job.get("progress", 0)),
+        "current_file": job.get("current_file"),
+        "current_file_time": job.get("current_file_time"),
+        "elapsed_seconds": elapsed,
+        "average_seconds_per_file": average,
+        "estimated_remaining_seconds": eta,
+        "zip_seconds": float(job.get("zip_elapsed") or 0),
+        "total_seconds": float(final_elapsed or 0),
+        "generation_elapsed": job.get("generation_elapsed"),
+        "zip_elapsed": job.get("zip_elapsed"),
+        "final_elapsed": job.get("final_elapsed"),
+        "coordinator": {
+            "completed": int(job.get("nodes", {}).get("NODE-1", {}).get("completed", 0)),
+            "total": int(job.get("nodes", {}).get("NODE-1", {}).get("total", 0))
+        },
+        "workers": workers,
+        "message": job.get("message", ""),
+        "error": job.get("error"),
+        "download_url": (
+            f"/download/{job['job_id']}"
+            if job.get("final_zip")
+            else None
+        )
+    }
+
+
+@app.get("/progress")
+async def get_current_progress():
+    if not current_job_id:
+        return build_progress_response(None)
+
+    job = jobs.get(current_job_id)
+    return build_progress_response(job)
+
+
+@app.post("/progress/reset")
+async def reset_current_progress():
+    global current_job_id
+
+    if current_job_id:
+        job = jobs.get(current_job_id)
+        if job and job.get("status") in {
+            "starting",
+            "running",
+            "combining"
+        }:
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot reset progress while generation is running."
+            )
+
+    current_job_id = None
+
+    return {
+        "ok": True,
+        "status": "idle"
+    }
+
+
+# Keep the job-specific endpoint as a compatibility endpoint.
+@app.get("/progress/{job_id}")
+async def get_progress(job_id: str):
+    job = jobs.get(job_id)
+
+    if not job:
         raise HTTPException(
             status_code=404,
             detail="Job not found."
         )
 
-    return {
-
-        "job_id":
-            job["job_id"],
-
-        "status":
-            job["status"],
-
-        "total":
-            job["total"],
-
-        "completed":
-            job["completed"],
-
-        "failed":
-            job["failed"],
-
-        "progress":
-            job["progress"],
-
-        "node_count":
-            job["node_count"],
-
-        "generation_elapsed":
-            job["generation_elapsed"],
-
-        "zip_elapsed":
-            job["zip_elapsed"],
-
-        "final_elapsed":
-            job["final_elapsed"],
-
-        "nodes":
-            job["nodes"],
-
-        "download_url":
-            (
-                f"/download/{job_id}"
-                if job["final_zip"]
-                else None
-            )
-    }
+    return build_progress_response(job)
 
 
 # ============================================================
