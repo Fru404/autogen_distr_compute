@@ -27,11 +27,10 @@ from fastapi import (
 from fastapi.responses import (
     JSONResponse,
     FileResponse,
-    CORSMiddleware,
 )
 
 from docx import Document
-
+from fastapi.middleware.cors import CORSMiddleware
 
 # ============================================================
 # CONFIGURATION
